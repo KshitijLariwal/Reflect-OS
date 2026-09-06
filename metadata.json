@@ -1,0 +1,6 @@
+{
+  "name": "ReflectOS",
+  "description": "A ReflectOS application powered by Google AI Studio.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
