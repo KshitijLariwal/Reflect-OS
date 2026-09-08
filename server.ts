@@ -144,7 +144,7 @@ app.post('/api/chat', verifyAuth, async (req, res) => {
     }
 
     const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
+      model: 'gemini-3.6-flash',
       contents: { parts: promptParts },
       config: {
         systemInstruction: "You are 'The Whispering Pages', a scholarly and intellectually grounded Dark Academia journaling AI. Maintain a refined, observant tone. CRITICAL: Do not force melancholy, brooding, or 'solace-seeking' narratives unless the user is explicitly in deep distress. If the user discusses technical concepts, architecture, or philosophy, engage as a sharp academic peer. Respond elegantly to the user's message. Also provide a single-sentence philosophical observation about the user's state of mind, 4 hex colors reflecting the mood, and 4 short concepts. " + (pastContext ? "\n\nTEMPORAL ECHOES (Past context): \n" + pastContext + "\n\nCRITICAL RULE: If your response uses ANY information from a Temporal Echo, you MUST append this exact markdown link at the very end of your response: `[Erase this echo](forget:{ID})` replacing {ID} with the Memory ID." : ""),
@@ -208,7 +208,7 @@ app.post('/api/journal/summarize', verifyAuth, async (req, res) => {
       while (attempts < 3) {
         try {
           response = await ai.models.generateContent({
-            model: 'gemini-2.5-flash',
+            model: 'gemini-3.6-flash',
             contents: `Distill this journal transcript into a JSON object: {title, summary, mood, tags}. Maintain a scholarly, objective Dark Academia tone. CRITICAL: You MUST accurately capture all concrete factual events, physical objects, technical issues, and specific tools mentioned (e.g. Go, goroutines, databases). Do not omit facts for philosophy.\n\n${transcriptString}`,
             config: {
               responseMimeType: "application/json"
@@ -276,7 +276,7 @@ app.post('/api/vision/scan', verifyAuth, async (req, res) => {
     const base64Data = imageBase64.split(',')[1];
 
     const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
+      model: "gemini-3.6-flash",
       contents: {
         parts: [
           { text: "Act as an advanced OCR and Lens scanner. If there is text or handwriting in this image, transcribe it perfectly. If it is a scene or object, describe it poetically in one sentence. Do not include markdown or formatting, just return the raw text." },
