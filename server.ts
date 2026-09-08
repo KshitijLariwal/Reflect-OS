@@ -1,106 +1,141 @@
 import express from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
-import { initializeApp } from 'firebase-admin/app';
+import { initializeApp, getApps, getApp, cert, applicationDefault } from 'firebase-admin/app';
 import { getAuth } from 'firebase-admin/auth';
 import { getFirestore, FieldValue } from 'firebase-admin/firestore';
 import { GoogleGenAI, Type } from '@google/genai';
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
+
+
 
 // Initialize Firebase Admin
+const serviceAccount = process.env.FIREBASE_PRIVATE_KEY ? {
+  projectId: process.env.FIREBASE_PROJECT_ID || 'gen-lang-client-0610859138',
+  clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+  privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+} : undefined;
+
 initializeApp({
-  projectId: 'gen-lang-client-0610859138'
+  credential: serviceAccount ? cert(serviceAccount) : applicationDefault(),
+  projectId: process.env.FIREBASE_PROJECT_ID || 'gen-lang-client-0610859138'
 });
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 app.use(express.json({ limit: '50mb' }));
+app.use(express.json());
+
+
+app.get('/api/health', (req, res) => {
+  try {
+    const firebaseStatus = getApps().length > 0 ? "Initialized" : "NOT Initialized";
+    const projectId = getApps().length > 0 ? getApp().options.projectId : "Unknown";
+    const geminiKey = process.env.GEMINI_API_KEY ? "Present" : "Missing";
+    
+    res.status(200).json({
+      status: "Server is running",
+      firebase: firebaseStatus,
+      projectId: projectId,
+      geminiKey: geminiKey,
+      env: process.env.NODE_ENV
+    });
+  } catch (error: any) {
+    res.status(500).send(`Health Check Failed: ${error.message}`);
+  }
+});
+
+
+app.get('/api/test-db', async (req, res) => {
+  try {
+    const testDoc = getFirestore('ai-studio-reflectos-59ca32a0-9f51-499e-8eee-fda4f36aa976').collection('system_tests').doc('connection_check');
+    await testDoc.set({ 
+      timestamp: FieldValue.serverTimestamp(),
+      status: 'success' 
+    });
+    
+    res.status(200).json({ message: "FIRESTORE WRITE SUCCESSFUL. The bug is in Auth." });
+  } catch (error: any) {
+    console.error("Firestore Test Error:", error);
+    res.status(500).json({ 
+      message: "FIRESTORE WRITE FAILED. The database might not exist.",
+      error: error.message 
+    });
+  }
+});
+
 
 // verifyAuth middleware
 const verifyAuth = async (req: express.Request, res: express.Response, next: express.NextFunction) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Unauthorized: No token provided' });
-  }
-
-  const token = authHeader.split('Bearer ')[1];
   try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: "Unauthorized: Missing or invalid Authorization header" });
+    }
+    const token = authHeader.split('Bearer ')[1];
     const decodedToken = await getAuth().verifyIdToken(token);
-    // Attach uid to req
+    (req as any).user = decodedToken;
     (req as any).uid = decodedToken.uid;
     next();
   } catch (error) {
-    console.error('Error verifying token:', error);
-    return res.status(401).json({ error: 'Unauthorized: Invalid token' });
+    console.error("Auth Middleware Error:", error);
+    return res.status(403).json({ error: "Unauthorized: Invalid token or Firebase Admin not initialized" });
   }
 };
 
+app.get('/api/test-auth', verifyAuth, (req, res) => {
+  res.json({ message: "Auth successful", uid: (req as any).uid });
+});
+
+
 // Example protected AI route
+app.post('/api/journal/embed', verifyAuth, async (req, res) => {
+  try {
+    const { text } = req.body;
+    if (!text) return res.status(400).json({ error: 'Text required' });
+    
+    const embeddingResponse = await ai.models.embedContent({
+      model: 'gemini-embedding-2',
+      contents: text,
+      config: { outputDimensionality: 768 }
+    });
+    
+    const vector = embeddingResponse.embeddings?.[0]?.values || [];
+    res.json({ vector });
+  } catch (error: any) {
+    console.error("Embed Error:", error);
+    res.status(500).json({ error: error.message || 'Failed to embed' });
+  }
+});
+
 app.post('/api/chat', verifyAuth, async (req, res) => {
   try {
     const uid = (req as any).uid;
-    const { message, imageBase64 } = req.body;
+    const { message, imageBase64, pastContext } = req.body;
     
-    // Ensure the user didn't send a completely empty request
     if (!message && !imageBase64) {
       return res.status(400).json({ error: 'Message or image is required' });
     }
 
-    let pastContext = "";
-    try {
-      if (message) {
-        const embeddingResponse = await ai.models.embedContent({
-          model: 'gemini-embedding-2-preview',
-          contents: message
-        });
-        const queryVector = embeddingResponse.embeddings?.[0]?.values || [];
-
-        // EDGE CASE 3: Firestore Vector Search
-        if (queryVector.length > 0) {
-          const db = getFirestore();
-          const entriesRef = db.collection('users').doc(uid).collection('entries');
-          const vectorQuery = entriesRef.findNearest('embedding', FieldValue.vector(queryVector), {
-            limit: 2,
-            distanceMeasure: 'COSINE'
-          });
-          
-          const snapshot = await vectorQuery.get();
-          
-          // EDGE CASE 4: Brand new user with empty database
-          if (!snapshot.empty) {
-            pastContext = "\n\nRelevant past reflections from this user: " + snapshot.docs.map(doc => doc.data().summary).join(" | ");
-          }
-        }
-      }
-    } catch (error) {
-      console.error("Vector Search failed, continuing without context:", error);
-      // Fail gracefully; do not break the chat if search fails
-    }
-
-    // Build the multimodal payload
     const promptParts: any[] = [];
     if (message) {
       promptParts.push({ text: message });
     }
     if (imageBase64) {
-      // Extract mime type and base64 data from the Data URL
       const mimeType = imageBase64.split(';')[0].split(':')[1];
       const base64Data = imageBase64.split(',')[1];
       promptParts.push({
-        inlineData: {
-          data: base64Data,
-          mimeType: mimeType
-        }
+        inlineData: { data: base64Data, mimeType: mimeType }
       });
     }
 
     const response = await ai.models.generateContent({
-      model: 'gemini-3.1-flash-lite',
+      model: 'gemini-2.5-flash',
       contents: { parts: promptParts },
       config: {
-        systemInstruction: `You are 'The Whispering Pages', a Dark Academia journaling AI. Respond elegantly to the user's message. Also provide a single-sentence philosophical observation about the user's state of mind, 4 hex colors reflecting the mood, and 4 short concepts.${pastContext}`,
+        systemInstruction: "You are 'The Whispering Pages', a scholarly and intellectually grounded Dark Academia journaling AI. Maintain a refined, observant tone. CRITICAL: Do not force melancholy, brooding, or 'solace-seeking' narratives unless the user is explicitly in deep distress. If the user discusses technical concepts, architecture, or philosophy, engage as a sharp academic peer. Respond elegantly to the user's message. Also provide a single-sentence philosophical observation about the user's state of mind, 4 hex colors reflecting the mood, and 4 short concepts. " + (pastContext ? "\n\nTEMPORAL ECHOES (Past context): \n" + pastContext + "\n\nCRITICAL RULE: If your response uses ANY information from a Temporal Echo, you MUST append this exact markdown link at the very end of your response: `[Erase this echo](forget:{ID})` replacing {ID} with the Memory ID." : ""),
         responseMimeType: "application/json",
         responseSchema: {
           type: "OBJECT",
@@ -133,43 +168,53 @@ app.post('/api/chat', verifyAuth, async (req, res) => {
         uid 
       });
     } catch (parseError) {
-      console.error('Failed to parse JSON response:', parseError);
-      res.json({ reply: response.text, uid });
+      console.error("JSON Parse Error:", parseError, "Raw Response:", response.text);
+      res.json({ reply: response.text, insight: "The ink runs in unpredictable ways.", colors: ["#2c2822", "#4a4238", "#d9a05b", "#143026"], concepts: ["Mystery", "Obscurity", "Ink", "Silence"], uid });
     }
   } catch (error: any) {
-    console.error('Error in /api/chat:', error);
-    if (error?.status === 429 || error?.message?.includes('429') || error?.message?.includes('Quota exceeded') || error?.status === 'RESOURCE_EXHAUSTED') {
-      return res.status(429).json({ error: "The whispers are too frequent. Please wait a moment before consulting the pages again." });
-    }
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Chat Error:', error);
+    res.status(500).json({ error: error.message || 'Failed to process chat' });
   }
 });
-
 
 app.post('/api/journal/summarize', verifyAuth, async (req, res) => {
   try {
     const uid = (req as any).uid;
     const { transcript } = req.body;
     
-    // EDGE CASE 1: Empty transcript
-    if (!transcript || transcript.length === 0) {
+    if (!transcript || !Array.isArray(transcript) || transcript.length === 0) {
       return res.status(400).json({ error: "No whispers to archive." });
     }
 
-    const transcriptString = Array.isArray(transcript) ? JSON.stringify(transcript) : transcript;
+    const transcriptString = transcript.map((msg: any) => 
+      `[${msg.role === 'user' ? 'User' : 'AI'}]: ${msg.text || msg.content}`
+    ).join('\n');
 
-    // 1. Generate Summary
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.1-flash-lite',
-      contents: `Distill this journal transcript into a raw JSON object: { "title": "string", "summary": "string", "mood": "string", "tags": ["string"] }\n\n${transcriptString}`,
-      config: {
-        responseMimeType: "application/json"
+    let response;
+    try {
+      let attempts = 0;
+      while (attempts < 3) {
+        try {
+          response = await ai.models.generateContent({
+            model: 'gemini-2.5-flash',
+            contents: `Distill this journal transcript into a JSON object: {title, summary, mood, tags}. Maintain a scholarly, objective Dark Academia tone. CRITICAL: You MUST accurately capture all concrete factual events, physical objects, technical issues, and specific tools mentioned (e.g. Go, goroutines, databases). Do not omit facts for philosophy.\n\n${transcriptString}`,
+            config: {
+              responseMimeType: "application/json"
+            }
+          });
+          break;
+        } catch (e: any) {
+          attempts++;
+          if (attempts >= 3 || e.status !== 'RESOURCE_EXHAUSTED') throw e;
+          await new Promise(r => setTimeout(r, 2000 * attempts));
+        }
       }
-    });
+    } catch (apiError: any) {
+      console.error("Gemini API Error during summarization:", apiError);
+      return res.status(500).json({ error: "Failed to generate summary from AI", details: apiError.message });
+    }
 
     let parsedSummary;
-    
-    // EDGE CASE 2: Malformed JSON from Gemini
     try {
       parsedSummary = JSON.parse(response.text?.replace(/```json/g, '').replace(/```/g, '') || '{}');
       if (!parsedSummary.title || !parsedSummary.summary) {
@@ -179,50 +224,36 @@ app.post('/api/journal/summarize', verifyAuth, async (req, res) => {
       parsedSummary = { title: "Archived Whisper", summary: "A quiet reflection.", mood: "calm", tags: ["reflection"] };
     }
 
-    // 2. Generate Vector Embedding
-    const embedResult = await ai.models.embedContent({
-      model: 'gemini-embedding-2-preview',
-      contents: `${parsedSummary.title}: ${parsedSummary.summary}`
-    });
+    let embedResult;
+    let embedAttempts = 0;
+    while (embedAttempts < 3) {
+      try {
+        embedResult = await ai.models.embedContent({
+          model: 'gemini-embedding-2',
+          contents: `${parsedSummary.title}: ${parsedSummary.summary}`,
+          config: {
+            outputDimensionality: 768
+          }
+        });
+        break;
+      } catch (e: any) {
+        embedAttempts++;
+        if (embedAttempts >= 3 || e.status !== 'RESOURCE_EXHAUSTED') throw e;
+        await new Promise(r => setTimeout(r, 2000 * embedAttempts));
+      }
+    }
     
     const vector = embedResult.embeddings?.[0]?.values || [];
 
-    // 3. Save to Firestore
-    const db = getFirestore();
-    const entryRef = db.collection('users').doc(uid).collection('entries').doc();
-    await entryRef.set({
-      ...parsedSummary,
-      transcript: transcriptString,
-      embedding: FieldValue.vector(vector),
-      createdAt: FieldValue.serverTimestamp()
-    });
-
-    res.json({ success: true, entryId: entryRef.id });
+    res.json({ success: true, summary: parsedSummary, transcript: transcript, vector: vector });
   } catch (error: any) {
     console.error('Archive Error:', error);
-    res.status(500).json({ error: 'Failed to bind the pages to the archive.' });
+    res.status(500).json({ error: error.message || 'Failed to bind the pages to the archive.' });
   }
 });
 
-app.get('/api/journal/entries', verifyAuth, async (req, res) => {
-  try {
-    const uid = (req as any).uid;
-    const db = getFirestore();
-    const snapshot = await db.collection('users').doc(uid).collection('entries')
-      .orderBy('createdAt', 'desc')
-      .limit(10)
-      .get();
-      
-    const entries = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-    
-    // Remove the heavy vectors and transcripts before sending to frontend
-    const safeEntries = entries.map(({ embedding, transcript, ...rest }) => rest);
-    res.json(safeEntries);
-  } catch (error) {
-    console.error("Fetch Entries Error:", error);
-    res.status(500).json({ error: "Could not dust off the archives." });
-  }
-});
+// Archive route replaced by client-side direct access to Firestore.
+
 
 app.post('/api/vision/scan', verifyAuth, async (req, res) => {
   try {
@@ -232,9 +263,8 @@ app.post('/api/vision/scan', verifyAuth, async (req, res) => {
     const mimeType = imageBase64.split(';')[0].split(':')[1];
     const base64Data = imageBase64.split(',')[1];
 
-    // Acting as Google Lens/OCR
     const response = await ai.models.generateContent({
-      model: "gemini-3.1-flash-lite",
+      model: "gemini-2.5-flash",
       contents: {
         parts: [
           { text: "Act as an advanced OCR and Lens scanner. If there is text or handwriting in this image, transcribe it perfectly. If it is a scene or object, describe it poetically in one sentence. Do not include markdown or formatting, just return the raw text." },
@@ -244,13 +274,13 @@ app.post('/api/vision/scan', verifyAuth, async (req, res) => {
     });
 
     res.json({ text: response.text });
-  } catch (error) {
+  } catch (error: any) {
     console.error("Vision API Error:", error);
-    res.status(500).json({ error: "The ink is too faded to read." });
+    res.status(500).json({ error: error.message || "The ink is too faded to read." });
   }
 });
 
-async function startServer() {
+async function setupVite() {
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -260,7 +290,6 @@ async function startServer() {
   } else {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
-    // Note: Use *all for Express v5, but we are using express 4.21.2 based on package.json
     app.get('*', (req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
@@ -271,4 +300,4 @@ async function startServer() {
   });
 }
 
-startServer();
+setupVite();

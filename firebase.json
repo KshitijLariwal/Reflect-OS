@@ -1,0 +1,6 @@
+{
+  "firestore": {
+    "rules": "firestore.rules",
+    "database": "ai-studio-reflectos-59ca32a0-9f51-499e-8eee-fda4f36aa976"
+  }
+}

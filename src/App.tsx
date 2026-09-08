@@ -1,15 +1,32 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { onAuthStateChanged, signInWithPopup, signOut, User } from 'firebase/auth';
-import { auth, googleProvider } from './firebase';
+import { auth, googleProvider, db } from './firebase';
+import { collection, query, orderBy, limit, getDocs, addDoc, serverTimestamp, vector, doc, deleteDoc, updateDoc } from 'firebase/firestore';
 import { Camera, Mic, PenTool, LogOut, Orbit, Flower2 } from 'lucide-react';
+import { AmbientConstellations } from './components/AmbientConstellations';
 import { motion } from 'motion/react';
+
+
+function cosineSimilarity(vecA: number[], vecB: number[]) {
+  let dotProduct = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < vecA.length; i++) {
+    dotProduct += vecA[i] * vecB[i];
+    normA += vecA[i] * vecA[i];
+    normB += vecB[i] * vecB[i];
+  }
+  if (normA === 0 || normB === 0) return 0;
+  return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
+}
 
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState('');
-  const [chatHistory, setChatHistory] = useState<{role: 'user' | 'assistant', content: string}[]>([]);
+  const [chatHistory, setChatHistory] = useState<{role: 'user' | 'assistant' | 'system', content: string}[]>([]);
   const [isSending, setIsSending] = useState(false);
+  const [isArchiving, setIsArchiving] = useState(false);
   const [isFeatureMenuOpen, setIsFeatureMenuOpen] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [isScanning, setIsScanning] = useState(false);
@@ -23,6 +40,183 @@ export default function App() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const lastMessageRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const featureMenuRef = useRef<HTMLDivElement>(null);
+
+
+  useEffect(() => {
+    function handleClickOutside(event: MouseEvent) {
+      if (featureMenuRef.current && !featureMenuRef.current.contains(event.target as Node)) {
+        setIsFeatureMenuOpen(false);
+      }
+    }
+    if (isFeatureMenuOpen) {
+      document.addEventListener("mousedown", handleClickOutside);
+    } else {
+      document.removeEventListener("mousedown", handleClickOutside);
+    }
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+    };
+  }, [isFeatureMenuOpen]);
+
+  const [isArchivesOpen, setIsArchivesOpen] = useState(false);
+  const [selectedEntry, setSelectedEntry] = useState<any>(null);
+  const [archivesData, setArchivesData] = useState<any[]>([]);
+  const [loadingArchives, setLoadingArchives] = useState(false);
+  const [isRewritingMemory, setIsRewritingMemory] = useState(false);
+  const [deletingIds, setDeletingIds] = useState<string[]>([]);
+  const [severedLinks, setSeveredLinks] = useState<{ [id: string]: string[] }>({});
+  const [burningMessages, setBurningMessages] = useState<number[]>([]);
+  const [isWhispersActive, setIsWhispersActive] = useState(() => {
+    const saved = localStorage.getItem('reflectos_whispers_v2_enabled');
+    return saved === 'true';
+  });
+
+  useEffect(() => {
+    localStorage.setItem('reflectos_whispers_v2_enabled', String(isWhispersActive));
+  }, [isWhispersActive]);
+
+
+  const forgetMemory = async (id: string) => {
+    if (!user) return;
+    try {
+      await deleteDoc(doc(db, 'users', user.uid, 'entries', id));
+      setChatHistory(prev => [...prev, { role: 'system', content: 'The pages have been burned. This memory will no longer echo.' }]);
+    } catch (err) {
+      console.error('Failed to forget memory', err);
+    }
+  };
+
+    const deleteEntry = async (id: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!user) return;
+    
+    // 1. Trigger Animation
+    setDeletingIds(prev => [...prev, id]);
+    
+    // 2. Wait for animation to finish
+    setTimeout(() => {
+      const docRef = doc(db, 'users', user.uid, 'entries', id);
+      setArchivesData(prev => prev.filter(item => item.id !== id));
+      if (selectedEntry?.id === id) {
+        setSelectedEntry(null);
+      }
+      setDeletingIds(prev => prev.filter(delId => delId !== id));
+      
+      // Background client-side deletion
+      void deleteDoc(docRef).catch(err => console.error('Background delete failed', err));
+    }, 800);
+  };
+  const removeMessage = async (entryId: string, messageIndex: number, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!user || !selectedEntry || isRewritingMemory) return;
+    
+    setIsRewritingMemory(true);
+    // Trigger Ink Bleed Animation
+    setBurningMessages(prev => [...prev, messageIndex]);
+    
+    setTimeout(() => {
+      setBurningMessages(prev => prev.filter(idx => idx !== messageIndex));
+      
+      const transcript = [...selectedEntry.transcript];
+      const targetMessage = transcript[messageIndex];
+      let startIdx = messageIndex;
+      let count = 1;
+      
+      // Only delete the specific AI response if requested, leave the preceding user prompt
+      if (targetMessage && targetMessage.role === 'user') {
+        if (messageIndex + 1 < transcript.length && transcript[messageIndex + 1].role !== 'user') count = 2;
+      }
+      transcript.splice(startIdx, count);
+
+      // Optimistically update without collapsing the card
+      if (transcript.length === 0) {
+        setArchivesData(prev => prev.filter(item => item.id !== entryId));
+        setSelectedEntry(null);
+      } else {
+        const optimisticEntry = { ...selectedEntry, transcript };
+        setSelectedEntry(optimisticEntry);
+        setArchivesData(prev => prev.map(item => item.id === entryId ? optimisticEntry : item));
+      }
+
+      // Background network sync
+      void (async () => {
+        try {
+          const docRef = doc(db, 'users', user.uid, 'entries', entryId);
+          if (transcript.length === 0) {
+            await deleteDoc(docRef);
+            return;
+          }
+          
+          await updateDoc(docRef, { transcript });
+
+          // Request new summary from the backend
+          const token = await auth.currentUser?.getIdToken();
+          const response = await fetch('/api/journal/summarize', {
+            method: 'POST',
+            headers: { 
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${token}`
+            },
+            body: JSON.stringify({ transcript })
+          });
+
+          if (!response.ok) throw new Error("Failed to summarize updated transcript");
+          
+          const data = await response.json();
+          const freshData = {
+            title: data.summary.title,
+            summary: data.summary.summary,
+            mood: data.summary.mood,
+            tags: data.summary.tags,
+            transcript: data.transcript,
+            embedding: vector(data.vector || [])
+          };
+          
+          await updateDoc(docRef, freshData);
+          
+          // Apply authoritative backend state
+          setArchivesData(prevArchives => 
+            prevArchives.map(entry => {
+              if (entry.id === entryId) {
+                const finalEntry = { ...entry, ...freshData };
+                if (selectedEntry?.id === entryId) {
+                  setSelectedEntry(finalEntry);
+                }
+                return finalEntry;
+              }
+              return entry;
+            })
+          );
+        } catch (error: any) {
+          console.error("Omit failed:", error);
+        } finally {
+          setIsRewritingMemory(false);
+        }
+      })();
+    }, 1000);
+  };
+
+
+  const fetchArchives = async () => {
+    if (!user) return;
+    setLoadingArchives(true);
+    try {
+      const entriesRef = collection(db, 'users', user.uid, 'entries');
+      const q = query(entriesRef, orderBy('createdAt', 'desc'), limit(10));
+      const querySnapshot = await getDocs(q);
+      
+      const entries = querySnapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      }));
+      setArchivesData(entries);
+    } catch (err) {
+      console.error("Failed to fetch archives", err);
+    } finally {
+      setLoadingArchives(false);
+    }
+  };
 
   const handleTextChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     setMessage(e.target.value);
@@ -178,34 +372,58 @@ export default function App() {
     img.src = URL.createObjectURL(file);
   };
 
-  const handleArchiveAndClear = async () => {
-    if (!user || chatHistory.length === 0 || isSending) return;
-    setIsSending(true);
-    try {
-      const token = await user.getIdToken();
-      const response = await fetch('/api/journal/summarize', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
-        },
-        body: JSON.stringify({ transcript: chatHistory })
-      });
-      if (response.ok) {
-        setChatHistory([]);
-        setMoodData({
-          insight: 'The spirit, poised at the threshold of expression, seeks its proper channel.',
-          colors: ['#e2e8f0', '#fef08a', '#fdf8ff', '#f1f5f9'],
-          concepts: ['Anticipation', 'New Beginning', 'Reflection', 'Silence']
-        });
-      }
-    } catch (error) {
-      console.error('Error archiving journal:', error);
-    } finally {
-      setIsSending(false);
-    }
-  };
+    const handleArchiveAndClear = () => {
+    if (chatHistory.length === 0) return; 
+    
+    const currentUser = auth.currentUser;
+    if (!currentUser) return;
 
+    // OPTIMISTIC UI: Instantly clear prompt & close menu
+    const transcriptToArchive = [...chatHistory];
+    setChatHistory([]);
+    setIsFeatureMenuOpen(false);
+    console.log("Optimistically bound to memory.");
+
+    // FIRE AND FORGET: Background processing
+    void (async () => {
+      try {
+        const token = await currentUser.getIdToken(true); 
+        const response = await fetch('/api/journal/summarize', {
+          method: 'POST',
+          headers: { 
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`
+          },
+          body: JSON.stringify({ transcript: transcriptToArchive })
+        });
+        
+        if (!response.ok) throw new Error("Backend failed");
+
+        const data = await response.json();
+        
+        const entryData = {
+          title: data.summary.title || "Echoes in the Dark",
+          summary: data.summary.summary || "A transient thought.",
+          mood: data.summary.mood || "CONTEMPLATIVE",
+          tags: data.summary.tags || ["Fragment"],
+          transcript: data.transcript,
+          embedding: vector(data.vector || []),
+          createdAt: serverTimestamp()
+        };
+        
+        const docRef = await addDoc(collection(db, 'users', currentUser.uid, 'entries'), entryData);
+        console.log("Background sync complete:", docRef.id);
+        
+        setMoodData({
+          insight: data.summary.insight || 'The spirit, poised at the threshold of expression, seeks its proper channel.',
+          colors: data.summary.colors || ['#e2e8f0', '#fef08a', '#fdf8ff', '#f1f5f9'],
+          concepts: data.summary.concepts || ['Anticipation', 'New Beginning', 'Reflection', 'Silence']
+        });
+      } catch (error: any) {
+        console.error("Background archive failed gracefully:", error);
+      }
+    })();
+  };
   const handleSendMessage = async () => {
     if (!message.trim() || !user || isSending) return;
 
@@ -219,13 +437,62 @@ export default function App() {
 
     try {
       const token = await user.getIdToken();
+      
+      // 1. Get embedding for the user message
+      let queryVector: number[] = [];
+      let pastContext = "";
+      try {
+        const embedRes = await fetch('/api/journal/embed', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`
+          },
+          body: JSON.stringify({ text: userMessage })
+        });
+        if (embedRes.ok) {
+          const embedData = await embedRes.json();
+          queryVector = embedData.vector || [];
+        }
+      } catch (e) {
+        console.error("Failed to get embedding:", e);
+      }
+
+      // 2. Local Vector Search
+      if (queryVector.length > 0) {
+        try {
+          const entriesSnap = await getDocs(collection(db, 'users', user.uid, 'entries'));
+          const scoredEntries = entriesSnap.docs.map(doc => {
+            const data = doc.data();
+            // Assuming data.embedding is an object like { values: [...] } from FieldValue.vector, or just an array
+            let vec: number[] = [];
+            if (Array.isArray(data.embedding)) vec = data.embedding;
+            else if (data.embedding?.values) vec = data.embedding.values;
+            else if (data.embedding?.value) vec = data.embedding.value; // Sometimes it's structured this way
+            
+            const score = vec.length === queryVector.length ? cosineSimilarity(queryVector, vec) : -1;
+            return { id: doc.id, summary: data.summary, score };
+          });
+          
+          scoredEntries.sort((a, b) => b.score - a.score);
+          const topEntries = scoredEntries.filter(e => e.score > 0.5).slice(0, 2);
+          
+          if (topEntries.length > 0) {
+            pastContext = topEntries.map(e => "Memory ID [" + e.id + "]: " + e.summary).join(" | ");
+          }
+        } catch (e) {
+          console.error("Local vector search failed:", e);
+        }
+      }
+
+      // 3. Send to Chat Backend
       const response = await fetch('/api/chat', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${token}`
         },
-        body: JSON.stringify({ message: userMessage })
+        body: JSON.stringify({ message: userMessage, pastContext })
       });
 
       if (!response.ok) {
@@ -256,6 +523,27 @@ export default function App() {
     }
   };
 
+  const renderMessage = (text: string) => {
+    if (!text) return null;
+    return text.split(/(\[Erase this echo\]\(forget:[a-zA-Z0-9_-]+\))/g).map((part, i) => {
+      const match = part.match(/\[Erase this echo\]\(forget:([a-zA-Z0-9_-]+)\)/);
+      if (match) {
+        const memoryId = match[1];
+        return (
+          <button
+            key={i}
+            onClick={() => forgetMemory(memoryId)}
+            className="ml-2 px-2 py-1 bg-red-900/20 text-xs text-red-400 hover:text-red-300 hover:bg-red-900/40 rounded cursor-pointer inline-block transition-colors"
+            title="Permanently erase this memory context"
+          >
+            [Erase this echo]
+          </button>
+        );
+      }
+      return <span key={i}>{part}</span>;
+    });
+  };
+
   if (loading) {
     return <div className="min-h-screen bg-[#1a362d] flex items-center justify-center text-[#f4eedf] font-serif text-xl tracking-widest">Awakening...</div>;
   }
@@ -284,7 +572,15 @@ export default function App() {
   }
 
   return (
-    <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', backgroundColor: '#1a1a1a', fontFamily: 'serif' }}>
+    <div className="atmospheric-bg" style={{ 
+      position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: 'serif',
+      '--color-1': isWhispersActive ? (moodData.colors[2] || '#1a362d') : '#e8ddcb',
+      '--color-2': isWhispersActive ? (moodData.colors[0] || '#1a1a1a') : '#dfd6c2',
+      background: 'radial-gradient(circle at top left, var(--color-1) 0%, var(--color-2) 100%)'
+    } as any}>
+      
+      {/* 1. Ambient Constellations */}
+      {isWhispersActive && <AmbientConstellations concepts={moodData.concepts} />}
       {/* 1. ABSOLUTE ROOT WRAPPER (Defeats global dark mode overrides) */}
       
       {/* 2. THE MAIN GLASSMORPHIC APP CONTAINER */}
@@ -299,9 +595,8 @@ export default function App() {
         
         {/* Sign out button (moved to root for mobile access) */}
         <button 
-          onClick={handleArchiveAndClear}
-          disabled={isSending}
-          className="absolute top-4 right-4 lg:top-6 lg:right-6 p-2 text-[#143026]/60 hover:text-[#143026] transition-colors disabled:opacity-50 z-50"
+          onClick={handleSignOut}
+          className="absolute top-4 right-4 lg:top-6 lg:right-6 p-2 text-[#143026]/60 hover:text-[#143026] transition-colors z-50"
           title="Sign Out"
         >
           <LogOut className="w-5 h-5" />
@@ -353,7 +648,7 @@ export default function App() {
           <div className="bg-[#f4eedf]/95 lg:bg-[#f4eedf] backdrop-blur-sm lg:backdrop-blur-none" style={{ flex: 1, minHeight: 0, borderRadius: '24px', display: 'flex', flexDirection: 'column', boxShadow: 'inset 0 2px 15px rgba(0,0,0,0.05), 0 10px 30px rgba(0,0,0,0.1)', overflow: 'hidden', marginBottom: '20px', border: '1px solid #dfd6c2', isolation: 'isolate', position: 'relative' }}>
             
             {/* THE ARCHIVIST'S FLOWER (FEATURE MENU) */}
-            <div className="absolute top-2 right-4 z-50">
+            <div ref={featureMenuRef} className="absolute top-2 right-4 z-50">
               <button 
                 onClick={() => setIsFeatureMenuOpen(!isFeatureMenuOpen)}
                 className="p-1 text-[#143026]/70 hover:text-[#d9a05b] transition-colors drop-shadow-sm"
@@ -368,19 +663,34 @@ export default function App() {
               
               {/* TRANSPARENT HUE WINDOW */}
               {isFeatureMenuOpen && (
-                <div className="absolute top-10 right-0 w-48 bg-[#e8ddcb]/30 backdrop-blur-md border border-white/30 shadow-[0_8px_30px_rgb(0,0,0,0.12)] rounded-xl overflow-hidden py-1 animate-fade-in">
+                <div className="absolute top-10 right-0 w-48 bg-[#e8ddcb]/30 backdrop-blur-md border border-white/30 shadow-[0_8px_30px_rgb(0,0,0,0.12)] rounded-xl overflow-hidden py-1 animate-fade-in flex flex-col">
+                  
+                  <button 
+                    className="w-full text-left px-4 py-3 text-sm font-serif text-[#143026] hover:bg-white/40 transition-colors disabled:opacity-50"
+                    type="button"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      handleArchiveAndClear();
+                    }}
+                    disabled={isArchiving || chatHistory.length === 0}
+                  >
+                    {isArchiving ? "Saving..." : "Bind to Archives 📜"}
+                  </button>
+                  
+                  <div className="w-full h-[1px] bg-white/20" />
+                  
                   <button 
                     className="w-full text-left px-4 py-3 text-sm font-serif text-[#143026] hover:bg-white/40 transition-colors"
-                    onClick={() => alert("Chat History UI opening...")}
+                    onClick={() => {
+                      setIsArchivesOpen(true);
+                      fetchArchives();
+                      setIsFeatureMenuOpen(false);
+                    }}
                   >
                     The Archives
                   </button>
-                  <button 
-                    className="w-full text-left px-4 py-3 text-sm font-serif text-[#143026]/50 hover:bg-white/30 transition-colors"
-                    disabled
-                  >
-                    Visual Whispers (v2)
-                  </button>
+                  
+
                 </div>
               )}
             </div>
@@ -388,10 +698,14 @@ export default function App() {
             {/* MOOD LANDSCAPE HEADER */}
             <div className="backdrop-blur-xl border-b border-white/20" style={{ height: '70px', flexShrink: 0, background: '#e8ddcb', display: 'flex', alignItems: 'center', justifyContent: 'center', position: 'relative', overflow: 'hidden', borderRadius: '24px 24px 0 0' }}>
                 <div className="absolute inset-0 bg-[#f4eedf]/50 blur-xl z-0" />
-                <div className="absolute -top-10 -left-10 w-48 h-48 rounded-[40%_60%_70%_30%] mix-blend-multiply blur-[20px] animate-pulse transition-colors duration-1000" style={{ backgroundColor: moodData.colors[0], animationDuration: '4s' }} />
-                <div className="absolute top-0 left-1/4 w-56 h-40 rounded-[60%_40%_30%_70%] mix-blend-multiply blur-[25px] animate-pulse transition-colors duration-1000" style={{ backgroundColor: moodData.colors[1], animationDuration: '5s' }} />
-                <div className="absolute -bottom-10 right-1/4 w-48 h-48 rounded-[30%_70%_70%_30%] mix-blend-multiply blur-[20px] animate-pulse transition-colors duration-1000" style={{ backgroundColor: moodData.colors[2], animationDuration: '6s' }} />
-                <div className="absolute -top-12 -right-10 w-56 h-56 rounded-[50%_50%_20%_80%] mix-blend-multiply blur-[25px] animate-pulse transition-colors duration-1000" style={{ backgroundColor: moodData.colors[3], animationDuration: '7s' }} />
+                {isWhispersActive && (
+                  <>
+                    <div className="absolute -top-10 -left-10 w-48 h-48 rounded-[40%_60%_70%_30%] mix-blend-multiply blur-[20px] animate-pulse transition-colors duration-1000" style={{ backgroundColor: moodData.colors[0], animationDuration: '4s' }} />
+                    <div className="absolute top-0 left-1/4 w-56 h-40 rounded-[60%_40%_30%_70%] mix-blend-multiply blur-[25px] animate-pulse transition-colors duration-1000" style={{ backgroundColor: moodData.colors[1], animationDuration: '5s' }} />
+                    <div className="absolute -bottom-10 right-1/4 w-48 h-48 rounded-[30%_70%_70%_30%] mix-blend-multiply blur-[20px] animate-pulse transition-colors duration-1000" style={{ backgroundColor: moodData.colors[2], animationDuration: '6s' }} />
+                    <div className="absolute -top-12 -right-10 w-56 h-56 rounded-[50%_50%_20%_80%] mix-blend-multiply blur-[25px] animate-pulse transition-colors duration-1000" style={{ backgroundColor: moodData.colors[3], animationDuration: '7s' }} />
+                  </>
+                )}
                 <div className="z-10 font-sans text-xs tracking-[0.2em] uppercase text-[#143026]/70">Mood Landscape</div>
             </div>
 
@@ -413,21 +727,25 @@ export default function App() {
                         animate={{ opacity: 1, y: 0 }}
                         key={idx} 
                         ref={isLast ? lastMessageRef : null}
-                        className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
+                        className={`flex ${msg.role === 'user' ? 'justify-end' : msg.role === 'system' ? 'justify-center' : 'justify-start'}`}
                       >
                         {msg.role === 'user' ? (
                           <div 
                             className="text-base leading-relaxed text-[#2c2822] bg-[#dfd6c2] px-5 py-3 rounded-2xl rounded-tr-sm max-w-[75%] self-end text-left shadow-sm"
-                            style={{ fontFamily: "'Playfair Display', Georgia, serif", textTransform: 'none', letterSpacing: 'normal', fontVariant: 'normal', wordBreak: 'break-all', whiteSpace: 'pre-wrap' }}
+                            style={{ fontFamily: "'Playfair Display', Georgia, serif", textTransform: 'none', letterSpacing: 'normal', fontVariant: 'normal', overflowWrap: 'break-word', wordBreak: 'normal', whiteSpace: 'pre-wrap' }}
                           >
                             {msg.content}
+                          </div>
+                        ) : msg.role === 'system' ? (
+                          <div className="text-xs italic text-red-800/70 text-center w-full my-2 font-serif tracking-wide w-full" style={{ width: '100%' }}>
+                             {msg.content}
                           </div>
                         ) : (
                           <div 
                             className="text-lg leading-loose text-[#143026] text-left max-w-[90%]"
-                            style={{ fontFamily: "'Playfair Display', Georgia, serif", textTransform: 'none', letterSpacing: 'normal', fontVariant: 'normal', wordBreak: 'break-all', whiteSpace: 'pre-wrap' }}
+                            style={{ fontFamily: "'Playfair Display', Georgia, serif", textTransform: 'none', letterSpacing: 'normal', fontVariant: 'normal', overflowWrap: 'break-word', wordBreak: 'normal', whiteSpace: 'pre-wrap' }}
                           >
-                            {msg.content}
+                            {renderMessage(msg.content)}
                           </div>
                         )}
                       </motion.div>
@@ -449,7 +767,7 @@ export default function App() {
 
             {/* INPUT AREA */}
             <div style={{ padding: '16px', background: '#f4eedf', borderTop: '1px solid transparent', flexShrink: 0 }}>
-               <div className="transition-all duration-200" style={{ position: 'relative', background: '#fff9f0', borderRadius: '16px', boxShadow: '0 0 15px 3px rgba(253,224,139,0.5)', padding: '4px', border: '1px solid rgba(255, 255, 255, 0.6)' }}>
+               <div className="flex items-center transition-all duration-200 gap-2" style={{ position: 'relative', background: '#fff9f0', borderRadius: '16px', boxShadow: '0 0 15px 3px rgba(253,224,139,0.5)', padding: '4px', border: '1px solid rgba(255, 255, 255, 0.6)' }}>
                   
                   <textarea
                     ref={textareaRef}
@@ -465,14 +783,14 @@ export default function App() {
                       }
                     }}
                     placeholder="Whisper to the pages..."
-                    className="w-full bg-transparent resize-none focus:outline-none text-base lg:text-lg leading-relaxed text-[#2c2822] placeholder-[#8c8273] pl-4 lg:pl-6 pr-[140px] lg:pr-[150px] py-4 lg:py-5 min-h-[60px] max-h-[65vh] [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]"
+                    className="flex-1 bg-transparent resize-none focus:outline-none text-base lg:text-lg leading-relaxed text-[#2c2822] placeholder-[#8c8273] pl-4 pr-2 lg:pl-6 py-4 lg:py-5 min-h-[60px] max-h-[150px] lg:max-h-[200px] overflow-y-auto [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]"
                     style={{ fontFamily: "'Playfair Display', Georgia, serif", textTransform: 'none', letterSpacing: 'normal', fontVariant: 'normal', wordBreak: 'normal' }}
                     rows={1}
                     disabled={isSending}
                   />
                   
-                  {/* Action Icons absolutely positioned */}
-                  <div className="absolute bottom-4 lg:bottom-5 right-3 lg:right-5 flex items-center gap-2 lg:gap-4 px-3">
+                  {/* Action Icons flex-positioned at the right */}
+                  <div className="flex items-center justify-end gap-1 lg:gap-3 px-2 flex-shrink-0">
                     <input type="file" accept="image/*" ref={fileInputRef} onChange={handleImageUpload} className="hidden" />
                     
                     {isScanning ? (
@@ -582,6 +900,202 @@ export default function App() {
         </div>
 
       </div>
+
+      {/* THE ARCHIVES OVERLAY */}
+      {isArchivesOpen && (
+        <div className="absolute inset-0 z-[100] bg-[#143026]/80 backdrop-blur-sm flex items-center justify-center p-4 lg:p-12 animate-fade-in" style={{ borderRadius: '24px' }}>
+          <div className="bg-[#f4eedf] w-full max-w-3xl max-h-full rounded-2xl shadow-2xl flex flex-col border border-[#d9a05b]/30">
+            
+            {/* Overlay Header */}
+            <div className="flex items-center justify-between p-6 border-b border-[#143026]/10 shrink-0">
+              <h2 className="text-xl lg:text-2xl font-serif text-[#143026] tracking-widest uppercase">The Archives</h2>
+              <button onClick={() => { setIsArchivesOpen(false); setSelectedEntry(null); }} className="p-2 text-[#143026]/60 hover:text-[#143026] hover:bg-[#143026]/5 rounded-full transition-colors">
+                 <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                 </svg>
+              </button>
+            </div>
+            
+            {/* Overlay Content */}
+            <div className="flex-1 overflow-y-auto p-4 lg:p-6 space-y-4 lg:space-y-6 [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]">
+              {selectedEntry ? (
+                <div className="flex flex-col h-full relative animate-fade-in">
+                  <button 
+                    onClick={() => setSelectedEntry(null)} 
+                    className="absolute -top-2 -left-2 p-2 text-[#143026]/60 hover:text-[#143026] flex items-center gap-2 text-sm font-sans tracking-widest uppercase transition-colors"
+                  >
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 19l-7-7m0 0l7-7m-7 7h18" /></svg>
+                    Back to Archives
+                  </button>
+                  <div className="mt-10 p-6 bg-white/60 rounded-xl border border-[#143026]/10 shadow-sm flex-1 overflow-y-auto">
+                    <div className="flex flex-col lg:flex-row justify-between items-start mb-6 gap-4 lg:gap-0">
+                      <h3 className="font-serif text-2xl text-[#143026] font-bold leading-tight">{selectedEntry.title}</h3>
+                      <span className="text-[10px] lg:text-xs font-sans text-[#143026]/60 tracking-wider uppercase shrink-0">
+                        {selectedEntry.createdAt ? 
+                          (typeof selectedEntry.createdAt.toDate === 'function' ? selectedEntry.createdAt.toDate().toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) 
+                          : selectedEntry.createdAt.seconds ? new Date(selectedEntry.createdAt.seconds * 1000).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) 
+                          : 'Unknown Date') 
+                        : 'Unknown Date'}
+                      </span>
+                    </div>
+                    
+                    <div className="flex gap-2 flex-wrap items-center mb-8 border-b border-[#143026]/10 pb-4">
+                      <span className="px-3 py-1.5 bg-[#d9a05b]/20 rounded-md text-[10px] lg:text-xs uppercase tracking-widest text-[#d9a05b] font-sans border border-[#d9a05b]/20">
+                        {selectedEntry.mood}
+                      </span>
+                      {selectedEntry.tags?.map((tag, i) => (
+                        <span key={i} className="px-3 py-1.5 bg-[#143026]/10 rounded-md text-[10px] lg:text-xs uppercase tracking-widest text-[#143026]/80 font-sans">
+                          {tag}
+                        </span>
+                      ))}
+                    </div>
+                    
+                    <h4 className="font-serif text-lg text-[#143026] mb-3">Reflection</h4>
+                    <p className="text-[#2c2822] font-serif leading-relaxed text-base mb-8 whitespace-pre-wrap" style={{ overflowWrap: 'break-word', wordBreak: 'normal' }}>{selectedEntry.summary}</p>
+                    
+                    {selectedEntry.transcript && (
+                      <>
+                        <div className="flex items-center justify-between mb-3">
+                          <h4 className="font-serif text-lg text-[#143026]">Original Dialogue</h4>
+                          {isRewritingMemory && (
+                            <span className="text-xs font-sans text-red-900/60 uppercase tracking-widest animate-pulse">
+                              Rewriting memory...
+                            </span>
+                          )}
+                        </div>
+                        <div className="bg-[#143026]/5 rounded-xl p-4 space-y-4">
+                          {(() => {
+                            let parsed = selectedEntry.transcript;
+                            if (typeof parsed === 'string') {
+                              try {
+                                parsed = JSON.parse(parsed);
+                              } catch(e) {
+                                return <div className="text-sm font-serif text-[#2c2822] whitespace-pre-wrap">{selectedEntry.transcript}</div>;
+                              }
+                            }
+                            if (Array.isArray(parsed)) {
+                              return parsed.map((msg, i) => (
+                                <div key={i} className={`flex group ${msg.role === 'user' ? 'justify-end' : 'justify-start'} ${burningMessages.includes(i) ? 'ink-bleed' : ''}`}>
+                                  <div className="flex items-center gap-2 max-w-[85%]">
+                                    {msg.role === 'user' && (
+                                      <button 
+                                        onClick={(e) => removeMessage(selectedEntry.id, i, e)}
+                                        disabled={isRewritingMemory}
+                                        className="opacity-0 group-hover:opacity-100 text-gray-500 hover:text-red-500 transition-opacity p-1 flex-shrink-0 relative z-10 cursor-pointer pointer-events-auto"
+                                        title="Omit this whisper"
+                                      >
+                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                                      </button>
+                                    )}
+                                    <div className={`p-3 rounded-lg text-sm font-serif ${msg.role === 'user' ? 'bg-[#dfd6c2] text-[#2c2822]' : 'bg-transparent text-[#143026]'}`} style={{ overflowWrap: 'break-word', wordBreak: 'normal', whiteSpace: 'pre-wrap' }}>
+                                      {msg.content}
+                                    </div>
+                                    {msg.role !== 'user' && (
+                                      <button 
+                                        onClick={(e) => removeMessage(selectedEntry.id, i, e)}
+                                        disabled={isRewritingMemory}
+                                        className="opacity-0 group-hover:opacity-100 text-gray-500 hover:text-red-500 transition-opacity p-1 flex-shrink-0"
+                                        title="Omit this whisper"
+                                      >
+                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                                      </button>
+                                    )}
+                                  </div>
+                                </div>
+                              ));
+                            }
+                            return <div className="text-sm font-serif text-[#2c2822] whitespace-pre-wrap">{typeof selectedEntry.transcript === 'string' ? selectedEntry.transcript : JSON.stringify(selectedEntry.transcript, null, 2)}</div>;
+                          })()}
+                        </div>
+                      </>
+                    )}
+                  </div>
+                </div>
+              ) : loadingArchives ? (
+                <div className="flex justify-center py-12 opacity-70">
+                  <span className="font-serif tracking-widest text-[#143026]">Dusting off the tomes...</span>
+                </div>
+              ) : archivesData.length === 0 ? (
+                <div className="flex justify-center py-12 opacity-70">
+                  <span className="font-serif tracking-widest text-[#143026]">The archives are empty.</span>
+                </div>
+              ) : (
+                archivesData.map((entry) => (
+                  <div key={entry.id} className={`bg-white/40 rounded-xl p-5 border border-[#143026]/5 shadow-sm hover:shadow-md hover:bg-white/60 transition-all cursor-pointer relative group ${deletingIds.includes(entry.id) ? 'burn-to-ash' : ''}`} onClick={() => setSelectedEntry(entry)}>
+                    <button
+                      onClick={(e) => deleteEntry(entry.id, e)}
+                      className="absolute top-4 right-4 text-[#7a3e3e]/50 hover:text-[#7a3e3e] opacity-0 group-hover:opacity-100 hover:bg-[#7a3e3e]/10 p-1.5 rounded-md transition-all relative z-10 cursor-pointer pointer-events-auto"
+                      title="Delete Entry"
+                    >
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                    </button>
+                    <div className="flex flex-col lg:flex-row justify-between items-start mb-3 gap-2 lg:gap-0 pr-8">
+                      <h3 className="font-serif text-lg text-[#143026] font-bold leading-tight">{entry.title}</h3>
+                      <span className="text-[10px] lg:text-xs font-sans text-[#143026]/60 tracking-wider uppercase shrink-0">
+                        {entry.createdAt ? 
+                          (typeof entry.createdAt.toDate === 'function' ? entry.createdAt.toDate().toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }) 
+                          : entry.createdAt.seconds ? new Date(entry.createdAt.seconds * 1000).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }) 
+                          : 'Unknown Date') 
+                        : 'Unknown Date'}
+                      </span>
+                    </div>
+                    <p className="text-[#2c2822] font-serif leading-relaxed text-sm mb-4">{entry.summary}</p>
+                    <div className="flex gap-2 flex-wrap items-center">
+                      <span className="px-2 py-1 bg-[#d9a05b]/20 rounded-md text-[9px] lg:text-[10px] uppercase tracking-widest text-[#d9a05b] font-sans border border-[#d9a05b]/20">
+                        {entry.mood}
+                      </span>
+
+                    </div>
+                    {(() => {
+                      const relatedEntries = archivesData.filter(other => 
+                        other.id !== entry.id && 
+                        other.tags?.some((tag: string) => entry.tags?.includes(tag)) &&
+                        !(severedLinks[entry.id] || []).includes(other.id) &&
+                        !(severedLinks[other.id] || []).includes(entry.id)
+                      ).slice(0, 2);
+                      
+                      if (relatedEntries.length === 0) return null;
+                      return (
+                        <div className="mt-4 pt-3 border-t border-[#143026]/10 flex flex-col gap-2">
+                          <p className="text-[10px] text-[#143026]/60 uppercase tracking-widest font-sans flex items-center gap-1">
+                            <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" /></svg>
+                            Ephemeral Threads
+                          </p>
+                          {relatedEntries.map(rel => (
+                            <div key={rel.id} className="group/thread flex items-center justify-between px-2 py-1 rounded bg-[#d9a05b]/5 border border-[#d9a05b]/10 hover:border-[#d9a05b]/40 transition-all cursor-crosshair">
+                              <span className="text-xs font-serif text-[#143026]/80 truncate max-w-[80%]">{rel.title}</span>
+                              <button 
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setSeveredLinks(prev => ({
+                                    ...prev,
+                                    [entry.id]: [...(prev[entry.id] || []), rel.id]
+                                  }));
+                                }}
+                                className="text-[#7a3e3e]/40 hover:text-[#7a3e3e] hover:bg-[#7a3e3e]/10 p-0.5 rounded opacity-0 group-hover/thread:opacity-100 transition-opacity"
+                                title="Sever Thread"
+                              >
+                                <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      );
+                    })()}
+                  </div>
+                ))
+              )}
+            </div>
+            
+          </div>
+        </div>
+      )}
+
     </div>
   );
+
+
+
+  
+
 }
