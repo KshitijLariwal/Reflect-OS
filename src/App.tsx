@@ -67,14 +67,7 @@ export default function App() {
   const [deletingIds, setDeletingIds] = useState<string[]>([]);
   const [severedLinks, setSeveredLinks] = useState<{ [id: string]: string[] }>({});
   const [burningMessages, setBurningMessages] = useState<number[]>([]);
-  const [isWhispersActive, setIsWhispersActive] = useState(() => {
-    const saved = localStorage.getItem('reflectos_whispers_v2_enabled');
-    return saved === 'true';
-  });
-
-  useEffect(() => {
-    localStorage.setItem('reflectos_whispers_v2_enabled', String(isWhispersActive));
-  }, [isWhispersActive]);
+  const [isWhispersActive, setIsWhispersActive] = useState(true); // Hardcoded to true since button was removed
 
 
   const forgetMemory = async (id: string) => {
