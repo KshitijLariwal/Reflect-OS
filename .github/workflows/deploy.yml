@@ -8,9 +8,9 @@ on:
 env:
   PROJECT_ID: caramel-biplane-506208-n7
   REGION: asia-south1
-  SERVICE: reflectos-web
+  SERVICE: reflectos
   REGISTRY: asia-south1-docker.pkg.dev
-  IMAGE_NAME: cloud-run-source-repo/reflectos-web
+  IMAGE_NAME: cloud-run-source-repo/reflectos
 
 jobs:
   deploy:
